@@ -1,0 +1,116 @@
+{-
+  TASK 4 - Caesar Cipher
+  Implement a Caesar cipher encryption and decryption functions.
+  The input is a string (https://docs.ton.org/develop/smart-contracts/guidelines/internal-messages#simple-message-with-comment)
+  where the text is encrypted in a cell (after 32bit 00000000 prefix flag), the algorithm rotates the characters and the last ASCII
+  character should go to the beginning. Return new text encoded in cell.
+-}
+
+{-
+  These instructions are taken from the documentation:
+  https://docs.ton.org/learn/tvm-instructions/instructions
+  All of these are just a more gas efficient way to do things.
+  Look them up on the linked page to see additional information.
+-}
+slice ref_as_slice(slice s) asm "LDREFRTOS NIP";
+builder store_builder_ref(builder b, builder b'') asm "ENDCST";
+
+() recv_internal() {
+}
+
+builder caesar_universal(int shift, slice text) inline {
+  builder output = begin_cell();
+
+  ;; One character encoded in ASCII is 8 bits or 2 bytes or 2 hexadecimals
+  repeat text.slice_bits() / 8 {
+    int char = text~load_uint(8);
+
+    ;; Nested `if`s due to how FunC handles booleans as ints with bitwise operations.
+    ;; See: https://stackoverflow.com/q/8691693 (in FunC & is like & in other languages)
+    ;; Used to detect whether:
+    ;; 1. The character is a letter (if it isn't - `char` won't be changed)
+    ;; 2. Whether the letter is uppercase or not
+    ;;
+    ;; The structure of these `if` statements is this specific,
+    ;; because in my local tests this was the most gas efficient, somehow.
+    if char <= 0x7A {
+      if char >= 0x41 {
+        ;; Simple caesar shifting here,
+        ;; first this removes the lower/uppercase number from the `char`
+        ;; (can use a minus instead and would be more gas efficient),
+        ;; then adds the shift,
+        ;; and mods that over 26 in case the character goes further than the alphabet,
+        ;; so it's shifted to the first letter and further.
+        ;; Then adds the lower/uppercase number prefix back.
+        if char <= 0x5A {
+          char = ((char % 0x41) + shift) % 26 + 0x41;
+        } elseif char >= 0x61 {
+          char = ((char % 0x61) + shift) % 26 + 0x61;
+        }
+      }
+    }
+
+    output~store_uint(
+      char,
+      8
+    );
+  }
+
+  ;; Recurses if there are references available.
+  ;; This technically would be more efficient to use lisp-style lists,
+  ;; but, for some reason, I couldn't make a solution more efficient than recursion.
+  if (text.slice_refs()) {
+    ;; `store_builder_ref` equivalent to and slightly more efficient than:
+    ;; `.store_ref(builder.end_cell())`
+    return output.store_builder_ref(
+      caesar_universal(shift, text.ref_as_slice())
+    );
+  } else {
+    return output;
+  }
+}
+
+;; testable
+(cell) caesar_cipher_encrypt(int shift, cell text) method_id {
+  ;; If this is a full shift (0, 26, 52, etc) there is no need to change anything.
+  ;;
+  ;; For more info see:
+  ;; https://docs.ton.org/develop/func/types#absence-of-boolean-type
+  ifnot shift % 26 {
+    return text;
+  }
+
+  slice text = text.begin_parse();
+  ;; First 32 bits are zeros. Check the article in task's description
+  text~skip_bits(32);
+
+  cell output = begin_cell()
+    ;; Add back the 32 zeros
+    .store_uint(0, 32)
+    ;; Store the result of encryption
+    .store_builder(
+      caesar_universal(shift, text)
+    )
+  .end_cell();
+
+  return output;
+}
+
+;; testable
+(cell) caesar_cipher_decrypt(int shift, cell text) method_id {
+  ifnot shift % 26 {
+    return text;
+  }
+  slice text = text.begin_parse();
+  text~skip_bits(32);
+
+  cell output = begin_cell()
+    .store_uint(0, 32)
+    .store_builder(
+      ;; The shift is inversed for encryption
+      caesar_universal(- shift, text)
+    )
+  .end_cell();
+
+  return output;
+}

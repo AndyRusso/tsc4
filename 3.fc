@@ -1,0 +1,190 @@
+{- 
+  TASK 3 - Find and replace binary substring
+  Binary string is represented as a cell linked list: string splitted to chunks,
+  first chunk stored to the root cell, next one to the cell in ref and so on;
+  each cell can have only one ref. 
+  Write the method that find and replaces one flags in the binary string
+  with another value. Flags and values can be can be of any length, but
+  strictly up to 128 bits. The method must replace every flag it finds.
+  Flag and the value to be replaced is guaranteed to be greater than 0.
+  Lets give a simple example. We have the target flag 101110101 and the value
+  to be written 111111111 as inputs, and a linked list of cells, in which the bit
+  value of the first cell ends with ...10100001011, and in the ref we have cell that
+  starts with 10101000111111...
+  The output should be a linked list where the first
+  cell ends with ...10100001111, and the second cell starts with 11111000111111...
+
+-}
+
+{-
+  These instructions are taken from the documentation:
+  https://docs.ton.org/learn/tvm-instructions/instructions
+  All of these are just a more gas efficient way to do things.
+  Look them up on the linked page to see additional information.
+-}
+
+;; Not used in this variant of the solution
+int slices_equal? (slice a, slice b) asm "SDEQ";
+int bits(int number) asm "UBITSIZE";
+int remaining_bits(builder b) asm "BREMBITS";
+slice ref_as_slice(slice b) asm "LDREFRTOS NIP";
+builder store_builder_ref(builder b, builder b'') asm "ENDCST";
+
+() recv_internal() {
+}
+
+{-
+  This solution iterates through the given cell bit by bit,
+  storing the intermediary value in an integer, and
+  removing the first significant bit from it if it's not equal to flag.
+  This allows to avoid calling `end_cell` every iteration.
+  That function is very costly (518 gas),
+  so even with all the additional bit shifting fuzz
+  this is still more efficient than my original solution.
+-}
+;; testable
+(cell) find_and_replace(int flag, int value, cell linked_list) method_id {
+  slice list = linked_list.begin_parse();
+
+  ;; Get all required amounts of bits
+  int flag_bits = bits(flag);
+  int flag_bits_one_less = flag_bits - 1;
+  int value_bits = bits(value);
+
+  ;; Referencing this variable is more efficient
+  ;; than calling `begin_cell` every time an empty builder is needed
+  builder empty_builder = begin_cell();
+
+  ;; I forgot to remove this
+  builder intermediary = empty_builder;
+
+  ;; The variable that's the list is going to be iterated through.
+  ;; 1 is the leading bit here.
+  int inter = 1;
+
+  ;; To accout for leading zeros in cells,
+  ;; the `inter` variable at the time of collecting data from `list`
+  ;; has an additional bit at the start,
+  ;; that lets me calculate the proper amount of bits in it.
+  ;; This is needed to properly calculate the amount of bits that
+  ;; should be stored in the `output` builder if `inter` doesn't match `flag`.
+  ;;
+  ;; And this variable has the leading bit for when the leading bit is removed.
+  int leading_1_less = 1 << flag_bits_one_less;
+  builder output = empty_builder;
+  ;; Lisp-style lists that will handle the order of references later on
+  tuple outputs = null();
+
+  ;; This basically exits the loop when `list` runs out of references 
+  while (list.slice_bits()) {
+    ;;       The bitwise OR basically works as a plus here 
+    ;; because after a shift (0b1 << 1 = 0b10) the last bit is zero
+    ;;  Bit for new data | Loading the bits from `list`
+    ;;            |      |          |
+    ;;            v      v          v       
+    ;;      |----------|   |---------------|
+    inter = (inter << 1) | list~load_uint(1);
+    ;; Amount of bits without counting the leading bit
+    int bs = inter.bits() - 1;
+
+    ;; This check only fails at the first run,
+    ;; or when `inter` matches `flag`. (`inter` is reset after that)
+    ;; So this could be optimized by loading flag length on the first run,
+    ;; and loading flag length when the replacement happens.
+    ;; But I ran out of time to implement this.
+    if (bs == flag_bits) {
+      ;; Remove the leading bit.
+      ;; This could also be moved to a variable similar to `leading_1_less` for optimization.
+      inter -= 1 << flag_bits;
+      if inter == flag {
+        ;; Using this asm function it's slightly more efficient than using:
+        ;; `if output.builder_bits() + value bits > 1023`
+        if output.remaining_bits() < value_bits {
+          ;; Push full builder to lisp list
+          outputs = cons(output, outputs);
+          ;; Empty builder 
+          output = empty_builder;
+        }
+
+        output~store_uint(value, value_bits);
+        ;; Reset `inter`.
+        ;; 1 is the leading bit here,
+        ;; on the next loop iteration it will be bit shifted.
+        inter = 1;
+      } else {
+        ;; Any int that's not 0 is interpreted as `true` in FunC.
+        ;; So here I `not` the amount of empty bits.
+        ;; This is slightly more efficient than:
+        ;; `if output.builder_bits() >= 1023`
+        ;; 
+        ;; For more info see:
+        ;; https://docs.ton.org/develop/func/types#absence-of-boolean-type
+        ifnot output.remaining_bits() {
+          outputs = cons(output, outputs);
+          output = empty_builder;
+        }
+
+        ;; Optimized equivalent of:
+        ;; 0b10101 >> (bits(0b10101) - 1) = 0b1
+        int last_bit = inter >> (flag_bits_one_less);
+        ;; Bits that aren't flags are put back with no changes
+        output~store_uint(last_bit, 1);
+
+        ;; This adds the leading bit and makes the actual bit length one less.
+        ;; In case that bit is already set to 1,
+        ;; I use the bitwise OR,
+        ;; because in that case nothing is going to change,
+        ;; unlike if a plus was used,
+        ;; then this number would not have the needed amount of bits,
+        ;; and overall would be different from what's needed.
+        inter = inter | leading_1_less;
+      }
+    }
+
+    ;; Because FunC uses bitwise operations on ints for booleans (more info linked above)
+    ;; having 2 `if` statements is more efficient than having one,
+    ;; because `slice_refs` would not be called if the slice isn't empty.
+    ;;
+    ;; For a deeper explanation see:
+    ;; https://stackoverflow.com/q/8691693 (in FunC & is like & in other languages)
+    if list.slice_data_empty?() {
+      if list.slice_refs() {
+        ;; This asm function is slightly more efficient and equivalent to:
+        ;; `list = list.preload_ref().begin_parse()`
+        list = list.ref_as_slice();
+      }
+    }
+  }
+
+  {-
+    This part of code handles a case when the last bits of the cell weren't the flag.
+    In that case, after the loop `inter` still has some data in it,
+    that's not stored to `output`.
+    So this checks if `inter` is empty,
+    and if it isn't: loads it in `output` without the leading bit.
+  -}
+  int inter_bits = inter.bits() - 1;
+  if inter_bits {
+    if output.remaining_bits() < inter_bits {
+      outputs = cons(output, outputs);
+      output = empty_builder;
+    }
+
+    ;;                          Removing the leading bit.
+    ;;         The leading bit isn't precalculated because it could be anything:
+    ;;                      1 <= `inter_bits` <= `flag_bits`
+    ;;                         |-----------------------|
+    output = output.store_uint(inter - (1 << inter_bits), inter_bits);
+  }
+
+  ;; Adds all builders to a linked list via references.
+  ;; Because of the way lisp-style lists work the order of builders is preserved.
+  while (~ outputs.null?()) {
+    ;;                    Slightly more efficient and equivalent to:
+    ;;                        .store_ref(output.end_cell())
+    ;;                          |------------------------|
+    output = outputs~list_next().store_builder_ref(output);
+  }
+
+  return output.end_cell();
+}
